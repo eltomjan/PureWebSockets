@@ -21,7 +21,7 @@ namespace PureWebsocketsTest
                 DebugMode = true,
                 SendDelay = 100,
                 IgnoreCertErrors = true,
-                MyReconnectStrategy = new ReconnectStrategy(2000, 4000, 20)
+                MyReconnectStrategy = new ReconnectStrategy(3000, 6000)
             };
 
             _ws = new PureWebSocket("wss://demos.kaazing.com/echo", socketOptions);
@@ -30,7 +30,15 @@ namespace PureWebsocketsTest
             _ws.OnMessage += Ws_OnMessage;
             _ws.OnClosed += Ws_OnClosed;
             _ws.OnSendFailed += Ws_OnSendFailed;
-            await _ws.ConnectAsync();
+            try
+            {
+                await _ws.ConnectAsync();
+            }
+            catch (Exception e) {
+                _ws.Dispose();
+                goto RESTART;
+            }
+
             
             Console.ReadLine();
             _ws.Dispose(true);
@@ -74,7 +82,7 @@ namespace PureWebsocketsTest
             Console.WriteLine($"{DateTime.Now} Connection Closed: {reason}");
             Console.ResetColor();
             Console.WriteLine("");
-            Console.ReadLine();
+            //Console.ReadLine();
         }
 
         private static void Ws_OnMessage(string message)
