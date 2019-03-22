@@ -7,7 +7,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Net;
 using System.Net.WebSockets;
 using System.Runtime.CompilerServices;
@@ -23,14 +22,8 @@ namespace PureWebSockets
         private ClientWebSocket _ws;
         private readonly PureWebSocketOptions _options;
         private readonly BlockingCollection<KeyValuePair<DateTime, string>> _sendQueue = new BlockingCollection<KeyValuePair<DateTime, string>>();
-        private bool _disconnectCalled;
-        private bool _listenerRunning;
-        private bool _senderRunning;
-        private bool _monitorRunning;
-        private bool _reconnecting;
-        private bool _reconnectNeeded;
+        private bool _reconnecting, _disconnectCalled, _listenerRunning, _senderRunning;
         private CancellationTokenSource _tokenSource = new CancellationTokenSource();
-        private Task _monitorTask;
         private Task _listenerTask;
         private Task _senderTask;
 
@@ -43,21 +36,13 @@ namespace PureWebSockets
         /// </summary>
         public int SendQueueLength => _sendQueue.Count;
 
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        public TimeSpan DefaultKeepAliveInterval
-        {
-            get => _ws.Options.KeepAliveInterval;
-            set => _ws.Options.KeepAliveInterval = value;
-        }
-
         public event Data OnData;
         public event Message OnMessage;
-        public event StateChanged OnStateChanged;
         public event Opened OnOpened;
-        public event Closed OnClosed;
         public event Error OnError;
         public event SendFailed OnSendFailed;
-        public event Fatality OnFatality;
+        public bool RunMonitor = true;
+        public bool MonitorFinished = false;
 
         public PureWebSocket(string url, IPureWebSocketOptions options)
         {
@@ -66,16 +51,17 @@ namespace PureWebSockets
 
             Log("Creating new instance.");
 
-            InitializeClient();
-
-            StartMonitor();
+            Task.Run(() =>
+            {
+                Monitor();
+            });
         }
-
-        public void Abort()
+        public void Dispose()
         {
-            _ws.Abort();
+            //Console.WriteLine(_ws.State);
+            if(_ws.State > WebSocketState.Connecting && _ws.State < WebSocketState.CloseReceived)
+                _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "CLIENT REQUESTED CLOSE", _tokenSource.Token);
         }
-
         private void InitializeClient()
         {
             _ws = new ClientWebSocket();
@@ -132,76 +118,11 @@ namespace PureWebSockets
                     }
                 }
         }
-
-        public bool Connect()
-        {
-            Log("Connect called.");
-            try
-            {
-                _disconnectCalled = false;
-                _ws.ConnectAsync(new Uri(Url), _tokenSource.Token).Wait(15000);
-                Log("Starting Listener & Sender tasks.");
-                StartListener();
-                StartSender();
-
-                Task.Run(async () =>
-                {
-                    while (_ws.State != WebSocketState.Open)
-                    {
-                        await Task.Delay(1);
-                    }
-                }).Wait(15000);
-
-                Log($"Connect result: {_ws.State == WebSocketState.Open}, State {_ws.State}");
-
-                return _ws.State == WebSocketState.Open;
-            }
-            catch (Exception ex)
-            {
-                Log($"Connect threw exception: {ex.Message}.");
-                OnError?.Invoke(ex);
-                throw;
-            }
-        }
-
-        public async Task<bool> ConnectAsync()
-        {
-            Log("Connect called.");
-            try
-            {
-                _disconnectCalled = false;
-                await _ws.ConnectAsync(new Uri(Url), _tokenSource.Token);
-                Log("Starting tasks.");
-                StartListener();
-                StartSender();
-
-                await Task.Run(async () =>
-                {
-                    var st = DateTime.UtcNow;
-
-                    while (_ws.State != WebSocketState.Open && (DateTime.UtcNow - st).TotalSeconds < 16)
-                    {
-                        await Task.Delay(1);
-                    }
-                });
-
-                Log($"Connect result: {_ws.State == WebSocketState.Open}, State {_ws.State}");
-
-                return _ws.State == WebSocketState.Open;
-            }
-            catch (Exception ex)
-            {
-                Log($"Connect threw exception: {ex.Message}.");
-                OnError?.Invoke(ex);
-                throw;
-            }
-        }
-
         public bool Send(string data)
         {
             try
             {
-                if ((State != WebSocketState.Open && !_reconnecting) || SendQueueLength >= _options.SendQueueLimit || _disconnectCalled)
+                if ((State != WebSocketState.Open && !_reconnecting) || SendQueueLength >= _options.SendQueueLimit)
                 {
                     Log(SendQueueLength >= _options.SendQueueLimit ? $"Could not add item to send queue: queue limit reached, Data {data}" : $"Could not add item to send queue: State {State}, Queue Count {SendQueueLength}, Data {data}");
                     return false;
@@ -222,261 +143,61 @@ namespace PureWebSockets
                 throw;
             }
         }
-
-        public async Task<bool> SendAsync(string data)
+        private void Monitor()
         {
-            try
+            Log($"Starting monitor.");
+            _tokenSource = new CancellationTokenSource();
+            while (RunMonitor)
             {
-                if ((State != WebSocketState.Open && !_reconnecting) || SendQueueLength >= _options.SendQueueLimit || _disconnectCalled)
+                do
                 {
-                    Log(SendQueueLength >= _options.SendQueueLimit ? $"Could not add item to send queue: queue limit reached, Data {data}" : $"Could not add item to send queue: State {State}, Queue Count {SendQueueLength}, Data {data}");
-                    return false;
-                }
+                    InitializeClient();
 
-                await Task.Run(() =>
-                {
-                    Log($"Adding item to send queue: Data {data}");
-                    _sendQueue.Add(new KeyValuePair<DateTime, string>(DateTime.UtcNow, data));
-                });
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Log($"Send threw exception: {ex.Message}.");
-                OnError?.Invoke(ex);
-                throw;
-            }
-        }
-
-        public bool Send(byte[] data, EncodingTypes encodingType = EncodingTypes.UTF8)
-        {
-            switch (encodingType)
-            {
-                case EncodingTypes.UTF7:
-                    return Send(Encoding.UTF7.GetString(data));
-                case EncodingTypes.UTF8:
-                    return Send(Encoding.UTF8.GetString(data));
-                case EncodingTypes.UTF32:
-                    return Send(Encoding.UTF32.GetString(data));
-                case EncodingTypes.ASCII:
-                    return Send(Encoding.ASCII.GetString(data));
-                case EncodingTypes.Unicode:
-                    return Send(Encoding.Unicode.GetString(data));
-                case EncodingTypes.BigEndianUnicode:
-                    return Send(Encoding.BigEndianUnicode.GetString(data));
-                case EncodingTypes.Default:
-                    return Send(Encoding.Default.GetString(data));
-                default:
-                    return Send(Encoding.Default.GetString(data));
-            }
-        }
-
-        public Task<bool> SendAsync(byte[] data, EncodingTypes encodingType = EncodingTypes.UTF8)
-        {
-            switch (encodingType)
-            {
-                case EncodingTypes.UTF7:
-                    return SendAsync(Encoding.UTF7.GetString(data));
-                case EncodingTypes.UTF8:
-                    return SendAsync(Encoding.UTF8.GetString(data));
-                case EncodingTypes.UTF32:
-                    return SendAsync(Encoding.UTF32.GetString(data));
-                case EncodingTypes.ASCII:
-                    return SendAsync(Encoding.ASCII.GetString(data));
-                case EncodingTypes.Unicode:
-                    return SendAsync(Encoding.Unicode.GetString(data));
-                case EncodingTypes.BigEndianUnicode:
-                    return SendAsync(Encoding.BigEndianUnicode.GetString(data));
-                case EncodingTypes.Default:
-                    return SendAsync(Encoding.Default.GetString(data));
-                default:
-                    return SendAsync(Encoding.Default.GetString(data));
-            }
-        }
-
-        private void StartMonitor()
-        {
-            Log($"Starting monitor. {_ws.State}");
-            _monitorTask = Task.Run(async () =>
-            {
-                Log("Entering monitor loop.");
-                _monitorRunning = true;
-                _reconnectNeeded = true;
-                try
-                {
-                    var lastState = State;
-                    while (_ws != null && !_disposedValue)
+                    Uri url = new Uri(Url);
+                    try
                     {
-                        if (lastState == State && State != WebSocketState.Closed)
-                        {
-                            await Task.Delay(200);
-                            continue;
-                        }
-                        if (_reconnecting)
-                        {
-                            // if we are reconnecting don't be so quick to fire off a state change
-                            if (_options.MyReconnectStrategy != null)
-                            {
-                                await Task.Delay(_options.MyReconnectStrategy.GetReconnectInterval() + 1000);
-                                if (_reconnecting)
-                                {
-                                    await Task.Delay(_options.MyReconnectStrategy.GetReconnectInterval());
-                                    // this gives us a max of 10 seconds to do a reconnect
-                                    if (!_reconnecting && State != WebSocketState.Open)
-                                    {
-                                        Log("Giving up");
-                                        return;
-                                    }
-                                }
-                                else if(State != WebSocketState.Open)
-                                {
-                                    Log("Not reconnecting");
-                                    return;
-                                }
-                            }
-                        }
-                        // don't fire if we just came off of an abort (reconnect)
-                        if ((lastState == WebSocketState.Aborted && !_reconnectNeeded) && (State == WebSocketState.Connecting || State == WebSocketState.Open))
-                            break;
-                        if (_reconnectNeeded && (State >= WebSocketState.Closed)) // + Aborted
-                            break;
+                        _reconnecting = true;
 
-                        // check again since this can change before the first check
-                        if (lastState == State)
+                        if (_disconnectCalled == true)
                         {
-                            await Task.Delay(200);
-                            continue;
+                            _disconnectCalled = false;
+                            Log("Re-connecting closed connection.");
                         }
 
-                        Log($"State changed from {lastState} to {State}.");
-                        OnStateChanged?.Invoke(State, lastState);
-
-                        if (State == WebSocketState.Open)
-                            OnOpened?.Invoke();
-
-                        if ((State == WebSocketState.Closed || State == WebSocketState.Aborted) && !_reconnecting)
-                        {
-                            Log("Closing");
-                            if (lastState == WebSocketState.Open && !_disconnectCalled && _options.MyReconnectStrategy != null && !_options.MyReconnectStrategy.AreAttemptsComplete())
-                            {
-                                Log("Reconnect needed.");
-                                // go through the reconnect strategy
-                                // Exit the loop and start async reconnect
-                                _reconnectNeeded = true;
-                                break;
-                            }
-                            OnClosed?.Invoke(_ws.CloseStatus ?? WebSocketCloseStatus.Empty);
-                            if (_ws.CloseStatus != null && _ws.CloseStatus != WebSocketCloseStatus.NormalClosure)
-                                OnError?.Invoke(new Exception(_ws.CloseStatus + " " + _ws.CloseStatusDescription));
-                        }
-
-                        lastState = State;
+                        _ws.ConnectAsync(url, _tokenSource.Token).Wait(15000);
                     }
-                }
-                catch (Exception ex)
+                    catch (Exception e)
+                    {
+                        Log(e.Message);
+                        _ws.Abort();
+                        _ws.Dispose();
+                        Thread.Sleep(_options.MyReconnectStrategy.GetReconnectInterval() - 1000);
+                    }
+                } while (RunMonitor && _ws.State != WebSocketState.Open);
+                _reconnecting = false;
+                Console.WriteLine("Starting Listener & Sender tasks.");
+                StartListener();
+                StartSender();
+                OnOpened?.Invoke();
+                while (_ws.State == WebSocketState.Open)
                 {
-                    Log($"Monitor threw exception: {ex.Message}.");
-                    OnError?.Invoke(ex);
+                    Thread.Sleep(200);
                 }
-                Log($"Exiting monitor. { _ws.State}");
-                _monitorRunning = false;
-                if (_reconnectNeeded && !_reconnecting && !_disconnectCalled)
-                    DoReconnect();                
-            });
+                _reconnecting = true;
+                for (int i=0;i<10;i++)
+                {
+                    if((_listenerRunning || _senderRunning) == false)
+                    {
+                        break;
+                    } else
+                    {
+                        Thread.Sleep(1000);
+                    }
+
+                }
+            }
+            MonitorFinished = true;
         }
-
-        private void DoReconnect()
-        {
-            Log("Entered reconnect.");
-            _ = Task.Run(async () =>
-             {
-                 _tokenSource.Cancel();
-                 _reconnecting = true;
-
-                 if (_listenerTask != null && _senderTask != null && _listenerRunning && _senderRunning
-                 && !Task.WaitAll(new[] { _monitorTask, _listenerTask, _senderTask }, 15000))
-                 {
-                     Log("Reconnect fatality, tasks failed to stop before the timeout.");
-                     // exit everything as dead...
-                     OnFatality?.Invoke("Fatal network error. Network services fail to shut down.");
-                     _reconnecting = false;
-                     _disconnectCalled = true;
-                     _tokenSource.Cancel();
-                     return;
-                 }
-                 Log("Disposing of current websocket.");
-                 _ws.Dispose();
-
-                 OnStateChanged?.Invoke(WebSocketState.Connecting, WebSocketState.Aborted);
-
-                 _tokenSource = new CancellationTokenSource();
-
-                 var connected = false;
-                 while (!_disconnectCalled && !_disposedValue && !connected && !_tokenSource.IsCancellationRequested)
-                     try
-                     {
-                         Log("Creating new websocket.");
-                         InitializeClient();
-                         if (!_monitorRunning)
-                         {
-                             Log($"Starting monitor. {_ws.State}");
-                             StartMonitor();
-                         }
-                         Log("Attempting connect.");
-                         connected = _ws.ConnectAsync(new Uri(Url), _tokenSource.Token).Wait(15000);
-                         Log($"Connect result: {connected}");
-                     }
-                     catch (Exception ex)
-                     {
-                         Log($"Reconnect threw an error: {ex.Message}.");
-                         Log("Disposing of current websocket.");
-                         _ws.Dispose();
-                         Log("Processing reconnect strategy.");
-                         await Task.Delay(_options.MyReconnectStrategy.GetReconnectInterval());
-                         _options.MyReconnectStrategy.ProcessValues();
-                         if (_options.MyReconnectStrategy.AreAttemptsComplete())
-                         {
-                             Log("Reconnect strategy has reached max connection attempts, going to fatality.");
-                             // exit everything as dead...
-                             OnFatality?.Invoke("Fatal network error. Max reconnect attempts reached.");
-                             _reconnectNeeded = false;
-                             _reconnecting = false;
-                             _disconnectCalled = true;
-                             _tokenSource.Cancel();
-                             return;
-                         }
-                     }
-                 if (connected)
-                 {
-                     Log($"Reconnect success, restarting tasks. {_ws.State}");
-                     _reconnectNeeded = false;
-                     _reconnecting = false;
-                     int RuningCode = (_monitorRunning ? 1 : 0) + (_listenerRunning ? 2 : 0) + (_senderRunning ? 4 : 0), RuningCode2 = 0;
-                     if (!_monitorRunning)
-                     {
-                         RuningCode2++;
-                         StartMonitor();
-                     }
-                     if (!_listenerRunning)
-                     {
-                         RuningCode2 += 2;
-                         StartListener();
-                     }
-                     if (!_senderRunning)
-                     {
-                         RuningCode2 += 4;
-                         StartSender();
-                     }
-                     Log($"Tasks started 1Monitor+2Listener+4Sender:{RuningCode}/{RuningCode2}");
-                 }
-                 else
-                 {
-                     Log("Reconnect failed.");
-                 }
-             });
-        }
-
         private void StartListener()
         {
             Log($"Starting listener. {_ws.State}");
@@ -486,7 +207,7 @@ namespace PureWebSockets
                 _listenerRunning = true;
                 try
                 {
-                    while (_ws.State == WebSocketState.Open && !_disposedValue && !_reconnecting)
+                    while (_ws.State == WebSocketState.Open && !_reconnecting)
                     {
                         var message = "";
                         var binary = new List<byte>();
@@ -504,7 +225,6 @@ namespace PureWebSockets
                         {
                             Log($"Receive threw an exception: {ex.Message}");
                             // Most likely socket error
-                            _reconnectNeeded = true;
                             _ws.Abort();
                             break;
                         }
@@ -515,9 +235,9 @@ namespace PureWebSockets
                         if (res.MessageType == WebSocketMessageType.Close)
                         {
                             Log("Server requested close.");
-                            await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "SERVER REQUESTED CLOSE", _tokenSource.Token);
+                            //await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "SERVER REQUESTED CLOSE", _tokenSource.Token);
                             _disconnectCalled = true;
-                            return Task.CompletedTask;
+                            break;
                         }
 
                         // handle text data
@@ -570,7 +290,6 @@ namespace PureWebSockets
                 return Task.CompletedTask;
             });
         }
-
         private void StartSender()
         {
             Log($"Starting sender. {_ws.State}");
@@ -580,15 +299,11 @@ namespace PureWebSockets
                 _senderRunning = true;
                 try
                 {
-                    while (!_disposedValue && !_reconnecting && _ws.State != WebSocketState.Aborted)
+                    while (!_reconnecting && _ws.State != WebSocketState.Aborted)
                     {
                         if (_ws.State == WebSocketState.Open && !_reconnecting)
                         {
                             if (SendQueueLength == 0) continue;
-                            {
-                                Thread.Sleep(_options.SendDelay);
-                                continue;
-                            }
                             var msg = _sendQueue.Take(_tokenSource.Token);
                             if (msg.Key.Add(_options.SendCacheItemTimeout) < DateTime.UtcNow)
                             {
@@ -606,7 +321,6 @@ namespace PureWebSockets
                                 Log($"Sender threw sending exception: {ex.Message}.");
                                 // Most likely socket error
                                 OnSendFailed?.Invoke(msg.Value, ex);
-                                _reconnectNeeded = true;
                                 _ws.Abort();
                                 break;
                             }
@@ -626,74 +340,6 @@ namespace PureWebSockets
                 return Task.CompletedTask;
             });
         }
-
-        public void Disconnect()
-        {
-            try
-            {
-                Log("Disconnect called, closing websocket.");
-                _disconnectCalled = true;
-                if(_ws.State > WebSocketState.None && _ws.State < WebSocketState.CloseSent)
-                    _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "NORMAL SHUTDOWN", _tokenSource.Token).Wait(_options.DisconnectWait);
-            }
-            catch (Exception ex)
-            {
-                Log($"Disconnect threw exception: {ex.Message}.");
-                // ignored
-            }
-        }
-
-        #region IDisposable Support
-
-        private bool _disposedValue; // To detect redundant calls
-
-        protected virtual void Dispose(bool disposing, bool waitForSendsToComplete)
-        {
-            if (!_disposedValue)
-            {
-                if (disposing)
-                {
-                    // dispose managed state (managed objects).
-                    if (_sendQueue.Count > 0 && _senderRunning)
-                    {
-                        var i = 0;
-                        while (_sendQueue.Count > 0 && _senderRunning)
-                        {
-                            i++;
-                            Task.Delay(1000).Wait();
-                            if (i > 25)
-                                break;
-                        }
-                    }
-                    Disconnect();
-                    _tokenSource.Cancel();
-                    Thread.Sleep(500);
-                    _tokenSource.Dispose();
-                    _ws.Dispose();
-                    GC.Collect();
-                }
-
-                _disposedValue = true;
-            }
-        }
-
-        // This code added to correctly implement the disposable pattern.
-        public void Dispose()
-        {
-            Log("Dispose called.");
-            // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
-            Dispose(true);
-        }
-
-        public void Dispose(bool waitForSendsToComplete)
-        {
-            Log($"Dispose called, with waitForSendsToComplete = {waitForSendsToComplete}.");
-            // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
-            Dispose(true, waitForSendsToComplete);
-        }
-
-        #endregion
-
         internal void Log(string message, [CallerMemberName] string memberName = "",// [CallerFilePath] string filePath = "",
         [CallerLineNumber] int lineNumber = 0)
         {
